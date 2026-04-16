@@ -10,6 +10,21 @@ from pydicom.uid import generate_uid, ExplicitVRLittleEndian
 from pydicom.dataset import FileMetaDataset
 
 
+def sagittal_cw_rotate(volume: np.ndarray, affine: np.ndarray):
+    """
+    Rotate each 2-D slice 90° clockwise (axes 1 and 2 of a slices×rows×cols volume).
+
+    The affine is intentionally NOT updated. The DICOM source has an identity affine
+    (orientation tags missing). If we updated the affine correctly, an orientation-aware
+    NIfTI viewer would undo the visual rotation by re-mapping physical coordinates —
+    leaving the display unchanged. By keeping the original affine both original.nii.gz
+    and mask.nii.gz share the same coordinate frame, so they stay registered with each
+    other, and the viewer displays the rotated data directly without correction.
+    """
+    rotated = np.rot90(volume, k=3, axes=(1, 2))
+    return rotated, affine
+
+
 def resolve_dense_mask_path(output_path, prefer_dicom=False):
     """
     Resolve the saved dense mask path for either NIfTI or DICOM outputs.
@@ -38,14 +53,17 @@ def resolve_final_mask_path(output_path, prefer_dicom=False):
     Resolve the saved final mask path for either NIfTI or DICOM outputs.
     Returns a file path or folder path, or None if not found.
     """
+    # mask.nii.gz is always checked first (preferred output format)
     if prefer_dicom:
         candidates = [
+            os.path.join(output_path, "dense_mask", "mask.nii.gz"),
+            os.path.join(output_path, "dense_mask", "mask.nii"),
             os.path.join(output_path, "mask_dcm"),
             os.path.join(output_path, "mask.dcm"),
-            os.path.join(output_path, "dense_mask", "mask.nii"),
         ]
     else:
         candidates = [
+            os.path.join(output_path, "dense_mask", "mask.nii.gz"),
             os.path.join(output_path, "dense_mask", "mask.nii"),
             os.path.join(output_path, "mask.dcm"),
             os.path.join(output_path, "mask_dcm"),
@@ -128,12 +146,24 @@ class DisplayTransform:
     def prepare_for_display(self, image, img_type: str, max_width=1200, max_height=800):
         """
         Prepare image for canvas display:
-          1) pad
-          2) normalize
-          3) rotate (DISPLAY ONLY)
-          4) scale to fit
+          1) squeeze to 2D if a 3D array arrives (some DICOMs lack NumberOfFrames
+             but pixel_array still returns (frames, rows, cols))
+          2) pad
+          3) normalize
+          4) rotate (DISPLAY ONLY)
+          5) scale to fit
         """
-        
+
+        # Guard: ensure we always work with a 2D slice
+        if image.ndim == 3:
+            slice_dim = int(np.argmin(image.shape))
+            idx = image.shape[slice_dim] // 2
+            if slice_dim == 0:
+                image = image[idx]
+            elif slice_dim == 1:
+                image = image[:, idx, :]
+            else:
+                image = image[:, :, idx]
 
         self.original_shape = image.shape
 
@@ -394,9 +424,6 @@ class MaskManager:
         series_desc = f"{base_name} mask"
 
         if os.path.isdir(source_path):
-            out_dir = os.path.join(output_dir, f"{base_name}_dcm")
-            os.makedirs(out_dir, exist_ok=True)
-
             from ImageLoader import DicomLoader
 
             dicom_files = DicomLoader._list_dicom_files(source_path)
@@ -404,6 +431,21 @@ class MaskManager:
             meta_list = DicomLoader._sort_series(meta_list)
 
             num_slices = len(meta_list)
+
+            # ---- Single-file multi-frame (e.g. DBT / tomosynthesis) ----
+            # Check BEFORE creating out_dir so we don't leave an empty dense_dcm/
+            # folder behind — resolve_dense_mask_path would find it and crash.
+            if num_slices == 1 and int(getattr(meta_list[0][1], "NumberOfFrames", 1)) > 1:
+                return MaskManager._save_dicom_mask(
+                    mask_3d=mask_3d,
+                    source_path=meta_list[0][0],
+                    output_dir=output_dir,
+                    base_name=base_name,
+                )
+
+            out_dir = os.path.join(output_dir, f"{base_name}_dcm")
+            os.makedirs(out_dir, exist_ok=True)
+
             if mask_3d.shape[0] != num_slices:
                 if mask_3d.shape[-1] == num_slices:
                     mask_3d = np.moveaxis(mask_3d, -1, 0)
@@ -572,22 +614,15 @@ class MaskManager:
                 f"Final volume shape {volume.shape} doesn't match original {original_shape}"
             )
         
-        if img_type == "DICOM":
-            if original_image_path is None:
-                raise ValueError("original_image_path is required for DICOM mask export.")
-            out_dir = os.path.dirname(folder_path)
-            mask_path = MaskManager._save_dicom_mask(
-                mask_3d=volume,
-                source_path=original_image_path,
-                output_dir=out_dir,
-                base_name="mask",
-            )
-            print(f"Final DICOM mask saved to {mask_path}")
-        else:
-            # Save NIfTI with original affine
-            mask_nii = nib.Nifti1Image(volume, original_affine)
-            nib.save(mask_nii, mask_path)
-            print(f"Final mask saved to {mask_path}")
+        # Rotate 90° CW in the sagittal plane so the output matches
+        # the rotated original.nii.gz saved in batch_process_step.
+        volume_out, affine_out = sagittal_cw_rotate(volume, original_affine)
+
+        # Always save as .nii.gz for NIfTI viewer overlay compatibility
+        mask_path = os.path.join(folder_path, 'mask.nii.gz')
+        mask_nii = nib.Nifti1Image(volume_out.astype(np.uint8), affine_out)
+        nib.save(mask_nii, mask_path)
+        print(f"Final mask saved to {mask_path}")
         
         # Clean up temporary .npy files
         print(f"Cleaning up {len(npy_files)} temporary .npy files...")

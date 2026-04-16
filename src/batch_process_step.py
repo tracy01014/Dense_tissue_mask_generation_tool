@@ -7,12 +7,50 @@ import threading
 import traceback
 import gc
 import numpy as np
+import nibabel as nib
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from ImageLoader import UnifiedImageLoader
-from new_utils import ThresholdOperator, MaskManager, DisplayTransform, resolve_dense_mask_path
+from new_utils import ThresholdOperator, MaskManager, DisplayTransform, resolve_dense_mask_path, sagittal_cw_rotate
 from performance_config import performance_config, get_system_info
+
+
+# =========================
+# Background job state
+# Module-level so it persists across Streamlit reruns
+# =========================
+_BG_JOB: dict = {
+    "running":    False,
+    "completed":  [],
+    "errors":     [],
+    "total":      0,
+    "done":       0,
+    "start_time": None,
+}
+_BG_LOCK = threading.Lock()
+
+
+def _run_bg_processing(files_to_process, input_folder, final_thresholds, max_workers):
+    """Runs in a daemon thread; updates _BG_JOB as files complete."""
+    global _BG_JOB
+    manager = BatchProcessingManager(max_workers=max_workers)
+    for file in files_to_process:
+        file_name = file.split('.')[0]
+        result = manager.process_single_file({
+            'file':             file,
+            'file_name':        file_name,
+            'input_folder':     input_folder,
+            'final_thresholds': final_thresholds,
+        })
+        with _BG_LOCK:
+            _BG_JOB["done"] += 1
+            if result["success"]:
+                _BG_JOB["completed"].append(result["file_name"])
+            else:
+                _BG_JOB["errors"].append(result)
+    with _BG_LOCK:
+        _BG_JOB["running"] = False
 
 
 # =========================
@@ -58,40 +96,69 @@ class BatchProcessingManager:
             if mask_path is None:
                 raise FileNotFoundError("Mask not found for this case.")
             
-            # Load central slice to calculate target area
-            central_image_slice, original_affine, original_shape, central_slice_idx, img_type = \
-                UnifiedImageLoader.load_slice(original_image_path)
-            central_mask_slice, _, _, _, _ = UnifiedImageLoader.load_slice(mask_path, central_slice_idx)
-            
+            # Load full volumes ONCE — avoids re-reading the file for every slice
+            # (for a multi-frame DICOM with N slices the old code did 2N file reads)
+            # load_image returns (volume, affine, shape, img_type) — 4 values
+            image_vol, original_affine, original_shape, img_type = \
+                UnifiedImageLoader.load_image(original_image_path)
+            mask_vol, _, _, _ = UnifiedImageLoader.load_image(mask_path)
+
+            # Save original volume as .nii.gz — rotated 90° CW in the sagittal
+            # plane so it displays correctly in ITK-SNAP / 3D Slicer.
+            # The mask is rotated the same way in create_final_mask, so they align.
+            orig_nii_path = os.path.join(output_path, 'original.nii.gz')
+            orig_rotated, affine_rotated = sagittal_cw_rotate(
+                image_vol.astype(np.float32), original_affine
+            )
+            nib.save(
+                nib.Nifti1Image(orig_rotated, affine_rotated),
+                orig_nii_path,
+            )
+            print(f"  Original saved as NIfTI (sagittal CW): {orig_nii_path}")
+
+            slice_dim = int(np.argmin(original_shape))
+            num_slices = original_shape[slice_dim]
+            central_slice_idx = num_slices // 2
+
+            # Extract central slice from the in-memory volume
+            if slice_dim == 0:
+                central_image_slice = image_vol[central_slice_idx].astype(np.float32)
+                central_mask_slice  = mask_vol[central_slice_idx].astype(np.float32)
+            elif slice_dim == 1:
+                central_image_slice = image_vol[:, central_slice_idx, :].astype(np.float32)
+                central_mask_slice  = mask_vol[:, central_slice_idx, :].astype(np.float32)
+            else:
+                central_image_slice = image_vol[:, :, central_slice_idx].astype(np.float32)
+                central_mask_slice  = mask_vol[:, :, central_slice_idx].astype(np.float32)
+
             # Calculate target area from central slice
             thresholded_img = ThresholdOperator.threshold_slice(
                 central_image_slice, central_mask_slice, T
             )
             target_area = MaskManager.measure_mask_area(thresholded_img)
-            
+
             print(f"Processing {file_name}:")
             print(f"  Original shape: {original_shape}")
             print(f"  Central slice index: {central_slice_idx}")
             print(f"  Target area: {target_area} pixels")
-            
+            print(f"  Slice dimension: {slice_dim}")
+            print(f"  Number of slices: {num_slices}")
+
             # Clean output directory
             if os.path.exists(save_dir):
                 for f in os.listdir(save_dir):
                     os.remove(os.path.join(save_dir, f))
             os.makedirs(save_dir, exist_ok=True)
-            
-            # Determine number of slices
-            slice_dim = np.argmin(original_shape)
-            num_slices = original_shape[slice_dim]
-            
-            print(f"  Slice dimension: {slice_dim}")
-            print(f"  Number of slices: {num_slices}")
-            
-            # Process all slices
+
+            # Process all slices using the pre-loaded volumes (no more per-slice I/O)
             slice_results = self._process_slices_optimized(
-                original_image_path, mask_path, save_dir,
+                image_vol, mask_vol, slice_dim, save_dir,
                 target_area, num_slices, img_type
             )
+
+            # Free large volumes before final mask assembly
+            del image_vol, mask_vol
+            gc.collect()
             
             # Create final NIfTI file from processed slices
             nifti_path = MaskManager.create_final_mask(
@@ -121,75 +188,70 @@ class BatchProcessingManager:
                 'error': error_msg
             }
     
-    def _process_slices_optimized(self, original_image_path, mask_path, save_dir,
+    def _process_slices_optimized(self, image_vol, mask_vol, slice_dim, save_dir,
                                  target_area, num_slices, img_type):
         """
-        Process all slices with optimized chunking and memory management.
+        Process all slices from pre-loaded in-memory volumes.
+        Volumes are loaded once by the caller to avoid repeated disk I/O.
         Slices are processed in NATIVE orientation and saved as-is.
         """
-        chunk_size = performance_config.get_chunk_size(num_slices)
         total_processed = 0
-        
+
         compression_level = self.io_settings['compression_level']
         gc_frequency = self.performance_settings['gc_frequency']
-        
+
         display_transform = DisplayTransform(padding=0)
         display_transform.set_rotation_for_type(img_type)
 
-        for start_idx in range(0, num_slices, chunk_size):
-            end_idx = min(start_idx + chunk_size, num_slices)
-            
-            for slice_index in range(start_idx, end_idx):
-                try:
-                    # Load slice in NATIVE orientation
-                    image_slice, _, _, _, _ = UnifiedImageLoader.load_slice(
-                        original_image_path, slice_index
+        for slice_index in range(num_slices):
+            try:
+                # Extract slice from pre-loaded volume — no disk I/O
+                if slice_dim == 0:
+                    image_slice = image_vol[slice_index].astype(np.float32)
+                    mask_slice  = mask_vol[slice_index].astype(np.float32)
+                elif slice_dim == 1:
+                    image_slice = image_vol[:, slice_index, :].astype(np.float32)
+                    mask_slice  = mask_vol[:, slice_index, :].astype(np.float32)
+                else:
+                    image_slice = image_vol[:, :, slice_index].astype(np.float32)
+                    mask_slice  = mask_vol[:, :, slice_index].astype(np.float32)
+
+                # Apply dynamic threshold adjustment
+                adjusted_threshold, thresholded_image = \
+                    ThresholdOperator.adjust_slice_threshold(
+                        image_slice, mask_slice, target_area
                     )
-                    mask_slice, _, _, _, _ = UnifiedImageLoader.load_slice(
-                        mask_path, slice_index
-                    )
-                    
-                    # Apply dynamic threshold adjustment
-                    adjusted_threshold, thresholded_image = \
-                        ThresholdOperator.adjust_slice_threshold(
-                            image_slice, mask_slice, target_area
-                        )
-                    
-                    # Convert to binary (0 or 255 for visualization)
-                    binary_image = np.where(thresholded_image > 0, 255, 0).astype(np.uint8)
-                    
-                    # Save as numpy array (in NATIVE orientation)
-                    npy_filename = f'slice_{slice_index:04d}_threshold_{adjusted_threshold:.2f}.npy'
-                    npy_filepath = os.path.join(save_dir, npy_filename)
-                    np.save(npy_filepath, binary_image)
-                    
-                    # Also save PNG for visualization (rotated for display)
-                    png_filename = f'slice_{slice_index:04d}_threshold_{adjusted_threshold:.2f}.png'
-                    png_filepath = os.path.join(save_dir, png_filename)
-                    
-                    # Apply rotation for PNG visualization (match GUI display)
-                    if display_transform.rotate_k % 4 != 0:
-                        binary_img_display = np.rot90(binary_image, k=display_transform.rotate_k)
-                    else:
-                        binary_img_display = binary_image
-                    img_pil = Image.fromarray(binary_img_display, mode='L')
-                    img_pil.save(png_filepath, optimize=True, compress_level=compression_level)
-                    
-                    total_processed += 1
-                    
-                    # Memory management
-                    with self.memory_lock:
-                        self.operations_count += 1
-                        if self.operations_count % gc_frequency == 0:
-                            gc.collect()
-                    
-                    # Clean up large variables
-                    del image_slice, mask_slice, thresholded_image, binary_image
-                    
-                except Exception as e:
-                    print(f"Error processing slice {slice_index}: {str(e)}")
-                    continue
-        
+
+                # Convert to binary (0 or 255 for visualization)
+                binary_image = np.where(thresholded_image > 0, 255, 0).astype(np.uint8)
+
+                # Save as numpy array (in NATIVE orientation)
+                npy_filename = f'slice_{slice_index:04d}_threshold_{adjusted_threshold:.2f}.npy'
+                np.save(os.path.join(save_dir, npy_filename), binary_image)
+
+                # Save PNG for visualization (rotated for display)
+                png_filename = f'slice_{slice_index:04d}_threshold_{adjusted_threshold:.2f}.png'
+                if display_transform.rotate_k % 4 != 0:
+                    binary_img_display = np.rot90(binary_image, k=display_transform.rotate_k)
+                else:
+                    binary_img_display = binary_image
+                img_pil = Image.fromarray(binary_img_display, mode='L')
+                img_pil.save(os.path.join(save_dir, png_filename),
+                             optimize=True, compress_level=compression_level)
+
+                total_processed += 1
+
+                with self.memory_lock:
+                    self.operations_count += 1
+                    if self.operations_count % gc_frequency == 0:
+                        gc.collect()
+
+                del image_slice, mask_slice, thresholded_image, binary_image
+
+            except Exception as e:
+                print(f"Error processing slice {slice_index}: {str(e)}")
+                continue
+
         return total_processed
     
     def process_files_batch(self, files_to_process, input_folder, final_thresholds,
@@ -307,6 +369,48 @@ def batch_process_step():
             files_to_process.append(file)
     
     # =========================
+    # Sync background job → session state
+    # =========================
+    with _BG_LOCK:
+        bg_running   = _BG_JOB["running"]
+        bg_done      = _BG_JOB["done"]
+        bg_total     = _BG_JOB["total"]
+        bg_completed = list(_BG_JOB["completed"])
+        bg_errors    = list(_BG_JOB["errors"])
+        bg_start     = _BG_JOB["start_time"]
+
+    for fname in bg_completed:
+        if fname not in st.session_state["batch_completed_files"]["process"]:
+            st.session_state["batch_completed_files"]["process"].append(fname)
+
+    # Recompute after sync
+    completed_process          = st.session_state["batch_completed_files"]["process"]
+    completed_process_filtered = [f for f in completed_process if f in batch_files_without_extension]
+    files_to_process = [
+        f for f in batch_files
+        if f.split('.')[0] in completed_threshold
+        and f.split('.')[0] not in completed_process
+    ]
+
+    # Background job status banner
+    if bg_running or (bg_total > 0 and not bg_running):
+        if bg_running:
+            st.info(f"⚙️ Background processing running — {bg_done}/{bg_total} files done")
+            st.progress(bg_done / bg_total if bg_total else 0)
+        else:
+            elapsed = (time.time() - bg_start) if bg_start else 0
+            st.success(f"✅ Background processing complete — {len(bg_completed)}/{bg_total} files in {elapsed:.1f}s")
+            if bg_errors:
+                with st.expander(f"⚠️ {len(bg_errors)} file(s) failed"):
+                    for e in bg_errors:
+                        st.code(e.get("error", str(e)))
+        st.divider()
+        # Auto-refresh every 2 s while running so progress updates
+        if bg_running:
+            time.sleep(2)
+            st.rerun()
+
+    # =========================
     # Progress Display
     # =========================
     total_files = len(batch_files)
@@ -372,7 +476,36 @@ def batch_process_step():
         help=f"Recommended: {default_workers} threads based on system resources"
     )
     
-    if st.button("🚀 Process All Files (Multi-threaded)", type="primary"):
+    # Background (non-blocking) button — user can navigate away while it runs
+    bg_btn_disabled = bg_running
+    if st.button(
+        "🚀 Start Background Processing  (navigate freely while running)",
+        type="primary",
+        disabled=bg_btn_disabled,
+        use_container_width=True,
+        help="Launches processing in a background thread. You can switch to the Draw or Threshold step while it runs.",
+    ):
+        with _BG_LOCK:
+            _BG_JOB.update({
+                "running":    True,
+                "completed":  [],
+                "errors":     [],
+                "total":      len(files_to_process),
+                "done":       0,
+                "start_time": time.time(),
+            })
+        t = threading.Thread(
+            target=_run_bg_processing,
+            args=(files_to_process, input_folder, final_thresholds, max_workers),
+            daemon=True,
+        )
+        t.start()
+        st.toast("Background processing started! Navigate freely — come back here to check progress.", icon="🚀")
+        st.rerun()
+
+    st.divider()
+
+    if st.button("⏳ Process All Files (stay on page until done)", use_container_width=True):
         progress_placeholder = st.empty()
         status_placeholder = st.empty()
         

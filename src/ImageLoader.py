@@ -153,7 +153,11 @@ class DicomLoader(BaseImageLoader):
         ps = DicomLoader._safe_float_list(ds0, "PixelSpacing", 2)
 
         if iop is None or ipp0 is None or ps is None:
-            print("WARNING: Missing DICOM orientation tags; using identity affine.")
+            import warnings
+            warnings.warn(
+                "Missing DICOM orientation tags; using identity affine.",
+                UserWarning, stacklevel=2,
+            )
             return np.eye(4, dtype=np.float32)
 
         row_cos = np.array(iop[:3], dtype=np.float32)
@@ -200,20 +204,31 @@ class DicomLoader(BaseImageLoader):
         Loads DICOM series from a folder.
         Returns: (volume, affine, original_shape, img_type)
         volume shape: (num_slices, rows, cols)
+
+        Handles two layouts:
+          - Multi-file series: one 2-D slice per .dcm file  (classic)
+          - Single-file multi-frame: entire stack in one .dcm (e.g. DBT)
         """
         dicom_files = DicomLoader._list_dicom_files(folder_path)
 
-        # Metadata-only read (fast) + robust sort
         meta_list = [(fp, DicomLoader._read_meta(fp)) for fp in dicom_files]
         meta_list = DicomLoader._sort_series(meta_list)
 
         ds0 = meta_list[0][1]
         ds1 = meta_list[1][1] if len(meta_list) > 1 else None
         affine = DicomLoader._compute_affine_series(ds0, ds1)
-        # Heavy part: load pixels in sorted order
+
+        # ---- Single-file multi-frame (e.g. DBT / tomosynthesis) ----
+        if len(meta_list) == 1 and int(getattr(ds0, "NumberOfFrames", 1)) > 1:
+            ds = pydicom.dcmread(meta_list[0][0])
+            volume = ds.pixel_array.astype(np.float32)   # (frames, rows, cols)
+            original_shape = volume.shape
+            return volume, affine, original_shape, DicomLoader.img_type
+
+        # ---- Classic multi-file series ----
         slices = []
         for fp, _ in meta_list:
-            ds = pydicom.dcmread(fp)  # loads PixelData
+            ds = pydicom.dcmread(fp)
             slices.append(ds.pixel_array.astype(np.float32))
 
         volume = np.stack(slices, axis=0)
@@ -223,24 +238,46 @@ class DicomLoader(BaseImageLoader):
     @staticmethod
     def load_slice(folder_path: str, slice_index: int | None = None):
         """
-        Loads a single slice from a DICOM folder series (fast: metadata sort, then 1 pixel read).
+        Loads a single slice from a DICOM folder series.
         Returns: (slice_data, affine, original_shape, slice_index_used, img_type)
+
+        Handles two layouts:
+          - Multi-file series: one 2-D slice per .dcm file  (classic)
+          - Single-file multi-frame: entire stack in one .dcm (e.g. DBT)
         """
         dicom_files = DicomLoader._list_dicom_files(folder_path)
 
         meta_list = [(fp, DicomLoader._read_meta(fp)) for fp in dicom_files]
         meta_list = DicomLoader._sort_series(meta_list)
 
+        ds0 = meta_list[0][1]
+        ds1 = meta_list[1][1] if len(meta_list) > 1 else None
+        affine = DicomLoader._compute_affine_series(ds0, ds1)
+
+        # ---- Single-file multi-frame (e.g. DBT / tomosynthesis) ----
+        if len(meta_list) == 1 and int(getattr(ds0, "NumberOfFrames", 1)) > 1:
+            num_frames = int(ds0.NumberOfFrames)
+            if slice_index is None:
+                slice_index = num_frames // 2
+            if slice_index < 0 or slice_index >= num_frames:
+                raise ValueError(
+                    f"Slice index {slice_index} out of range. File has {num_frames} frames."
+                )
+            ds = pydicom.dcmread(meta_list[0][0])
+            arr = ds.pixel_array.astype(np.float32)   # (frames, rows, cols)
+            slice_data = arr[slice_index]
+            rows = int(getattr(ds, "Rows", slice_data.shape[0]))
+            cols = int(getattr(ds, "Columns", slice_data.shape[1]))
+            original_shape = (num_frames, rows, cols)
+            return slice_data, affine, original_shape, slice_index, DicomLoader.img_type
+
+        # ---- Classic multi-file series ----
         num_slices = len(meta_list)
         if slice_index is None:
             slice_index = num_slices // 2
 
         if slice_index < 0 or slice_index >= num_slices:
             raise ValueError(f"Slice index {slice_index} out of range. Series has {num_slices} slices.")
-
-        ds0 = meta_list[0][1]
-        ds1 = meta_list[1][1] if len(meta_list) > 1 else None
-        affine = DicomLoader._compute_affine_series(ds0, ds1)
 
         target_fp = meta_list[slice_index][0]
         ds = pydicom.dcmread(target_fp)

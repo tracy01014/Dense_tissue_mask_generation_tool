@@ -1,11 +1,47 @@
 import os
-import io
 import json
 import numpy as np
-import matplotlib.pyplot as plt
 import streamlit as st
+from PIL import Image
 from ImageLoader import UnifiedImageLoader
-from new_utils import ThresholdOperator, ImageProcessor, DisplayTransform, resolve_dense_mask_path
+from new_utils import ImageProcessor, DisplayTransform, resolve_dense_mask_path
+
+
+@st.cache_data(show_spinner=False)
+def _load_display_data(original_image_path, mask_path):
+    """Load + normalise images once per file; cached so the slider doesn't re-read disk."""
+    img, _, _, _, img_type = UnifiedImageLoader.load_slice(original_image_path)
+    msk, _, _, _, _        = UnifiedImageLoader.load_slice(mask_path)
+    img_show = ImageProcessor.normalize_image(img)          # uint8 0-255
+    msk_show = (msk > 0).astype(np.uint8)                   # binary
+    dt = DisplayTransform(padding=0)
+    dt.set_rotation_for_type(img_type)
+    if dt.rotate_k % 4 != 0:
+        img_show = np.rot90(img_show, k=dt.rotate_k)
+        msk_show = np.rot90(msk_show, k=dt.rotate_k)
+    return img_show, msk_show, img_type
+
+
+def _render_threshold_pil(img_show, msk_show, threshold, width):
+    """
+    Fast PIL-based threshold overlay.
+    Replaces matplotlib figure rendering (was ~4800×4800 px at dpi=300).
+    Thresholded pixels get a red tint at 35% alpha; everything else stays grey.
+    """
+    norm         = img_show.astype(np.float32) / 255.0
+    thresh_region = (norm > threshold) & (msk_show > 0)
+
+    rgb = np.stack([img_show, img_show, img_show], axis=-1).astype(np.float32)
+    rgb[thresh_region, 0] = rgb[thresh_region, 0] * 0.65 + 255 * 0.35  # red
+    rgb[thresh_region, 1] = rgb[thresh_region, 1] * 0.65
+    rgb[thresh_region, 2] = rgb[thresh_region, 2] * 0.65
+    result = rgb.clip(0, 255).astype(np.uint8)
+
+    pil_img = Image.fromarray(result)
+    h, w    = result.shape[:2]
+    if w > 0:
+        pil_img = pil_img.resize((width, max(1, int(width * h / w))), Image.LANCZOS)
+    return pil_img
 
 
 def batch_threshold_step():
@@ -47,28 +83,48 @@ def batch_threshold_step():
     # =====================================================
     # Draw step completion check
     # =====================================================
-    if len(completed_draw) < len(batch_files):
-        st.warning(f"Please complete all drawing steps first. {len(completed_draw)}/{len(batch_files)} completed.")
+    if len(completed_draw) == 0:
+        st.error("No masks drawn yet. Please draw at least one mask first.")
         if st.button("← Back to Draw Step"):
             st.session_state["current_step"] = "batch_draw"
             st.rerun()
         return
 
+    if len(completed_draw) < len(batch_files):
+        remaining = len(batch_files) - len(completed_draw)
+        st.info(
+            f"{len(completed_draw)}/{len(batch_files)} masks ready. "
+            f"{remaining} file{'s' if remaining != 1 else ''} still need{'s' if remaining == 1 else ''} a mask — "
+            "you can go back to draw them at any time."
+        )
+        if st.button("← Back to Draw Step", use_container_width=False):
+            st.session_state["current_step"] = "batch_draw"
+            st.rerun()
+
     # =====================================================
-    # Progress bar and overall navigation 
+    # Progress bar and overall navigation
     # =====================================================
-    total_files = len(batch_files)
-    st.write(f"### Progress: {len(completed_threshold)}/{total_files} files completed")
-    st.progress(len(completed_threshold) / total_files)
+    # Use only files that have a mask as the denominator
+    files_with_mask = len(completed_draw)
+    st.write(f"### Progress: {len(completed_threshold)}/{files_with_mask} files thresholded")
+    st.progress(len(completed_threshold) / files_with_mask if files_with_mask else 0)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # If all files are processed for threshold step
-    if current_index >= len(batch_files):
-        st.success("🎉 All thresholds have been set!")
-        if st.button("→ Continue to Process Step"):
+    # Show process button as soon as at least one file has both mask + threshold
+    if len(completed_threshold) > 0:
+        if st.button(
+            f"→ Go to Process Step ({len(completed_threshold)} file{'s' if len(completed_threshold) != 1 else ''} ready)",
+            type="primary",
+            use_container_width=True,
+        ):
             st.session_state["current_step"] = "batch_process"
             st.rerun()
-        if st.button("Back to Draw Step"):
+
+    # "Done" when every masked file also has a threshold — show completion message
+    all_masked_files_thresholded = all(f in completed_threshold for f in completed_draw)
+    if current_index >= len(batch_files) or all_masked_files_thresholded:
+        st.success(f"🎉 All {files_with_mask} masked files have been thresholded!")
+        if st.button("← Back to Draw Step", use_container_width=False):
             st.session_state["current_step"] = "batch_draw"
             st.rerun()
         return
@@ -104,7 +160,7 @@ def batch_threshold_step():
     # =====================================================
     st.markdown(f"""
     <div class="current-file">
-        <h4>📁 {current_file} ({current_index + 1}/{total_files})</h4>
+        <h4>📁 {current_file} ({current_index + 1}/{len(batch_files)})</h4>
         <p>💡 Navigate between files to adjust thresholds • Saved files are locked</p>
     </div>
     """, unsafe_allow_html=True)
@@ -157,21 +213,13 @@ def batch_threshold_step():
         return
 
     try:
-        img, _, _, _, img_type = UnifiedImageLoader.load_slice(original_image_path)
-        msk, _, _, _, _ = UnifiedImageLoader.load_slice(mask_path)
-        img_show = ImageProcessor.normalize_image(img)
-        msk_show = msk
-        # Match display orientation from draw step (rotate only for NIfTI)
-        display_transform = DisplayTransform(padding=0)
-        display_transform.set_rotation_for_type(img_type)
-        if display_transform.rotate_k % 4 != 0:
-            img_show = np.rot90(img_show, k=display_transform.rotate_k)
-            msk_show = np.rot90(msk_show, k=display_transform.rotate_k)
+        img_show, msk_show, img_type = _load_display_data(original_image_path, mask_path)
     except Exception as e:
         st.error(f"Error loading images: {str(e)}")
         if st.button("Skip this file"):
             st.session_state["batch_current_index"] = current_index + 1
             st.rerun()
+        return
 
     # =====================================================
     # Threshold preview and controls 
@@ -243,46 +291,26 @@ def batch_threshold_step():
 
     # Image preview section
     st.markdown("### Image Preview")
-    
+
+    col_w = int(selected_width * 0.55)
+    h, w  = img_show.shape
+    orig_pil = Image.fromarray(img_show).resize(
+        (col_w, max(1, int(col_w * h / w))), Image.LANCZOS
+    )
+
     if comparison_mode:
-        # Side-by-side comparison
         img_col1, img_col2 = st.columns(2)
-        
         with img_col1:
             st.markdown("**Original Image**")
-            fig_raw, ax_raw = plt.subplots(figsize=(16, 16))
-            ax_raw.imshow(img_show, cmap='gray')
-            ax_raw.axis('off')
-            buf_raw = io.BytesIO()
-            fig_raw.savefig(buf_raw, format='png', bbox_inches='tight', pad_inches=0.05, 
-                          facecolor='white', dpi=300)
-            buf_raw.seek(0)
-            plt.close(fig_raw)
-            st.image(buf_raw, width=int(selected_width*0.60))
-            
+            st.image(orig_pil, width=col_w)
         with img_col2:
             st.markdown("**Thresholded Result**")
-            # Display thresholded image
-            fig_thresh = ThresholdOperator.display_thresholded_slice(img_show, msk_show, threshold)
-            fig_thresh.set_size_inches(16, 16)
-            buf_thresh = io.BytesIO()
-            fig_thresh.savefig(buf_thresh, format='png', bbox_inches='tight', pad_inches=0.05, dpi=300)
-            buf_thresh.seek(0)
-            plt.close(fig_thresh)
-            st.image(buf_thresh, width=int(selected_width*0.60))
-            
+            st.image(_render_threshold_pil(img_show, msk_show, threshold, col_w), width=col_w)
     else:
-        # Single thresholded image view
-        # Center the image
-        img_display_col1, img_display_col2, img_display_col3 = st.columns([1, 2, 1])
-        with img_display_col2:
-            fig = ThresholdOperator.display_thresholded_slice(img_show, msk_show, threshold)
-            fig.set_size_inches(16, 16)
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.05, dpi=300)
-            buf.seek(0)
-            plt.close(fig)
-            st.image(buf, width=selected_width)
+        _, img_col, _ = st.columns([1, 2, 1])
+        with img_col:
+            st.image(_render_threshold_pil(img_show, msk_show, threshold, selected_width),
+                     width=selected_width)
 
     # Action buttons section
     st.markdown("---")
