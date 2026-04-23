@@ -2,22 +2,243 @@
 # Imports
 # =========================
 import os
+import sys
+import json
+import pickle
+import tempfile
+import threading
+import subprocess
+from collections import OrderedDict
+
 import streamlit as st
 import numpy as np
 import plotly.express as px
 from streamlit_plotly_events import plotly_events
 
-from new_utils import MaskManager, DisplayTransform, resolve_dense_mask_path
+from new_utils import (
+    MaskManager,
+    DisplayTransform,
+    apply_orientation,
+    orient_shape_3d,
+    save_polygon_mask_dcm,
+    load_polygon_mask_2d,
+)
 from ImageLoader import UnifiedImageLoader
 
 
-@st.cache_data(show_spinner=False)
-def _load_slice_cached(file_path):
-    return UnifiedImageLoader.load_slice(file_path)
+# =====================================================================
+# Background prefetch
+# =====================================================================
+# Loading the next DBT file costs 10-20s because pydicom decompresses the
+# whole multi-frame volume even when we only want the central slice, and
+# the decode path can hold the GIL long enough to stall Streamlit's UI.
+#
+# To keep the polygon canvas responsive while the next file loads we run
+# the prefetch in a SEPARATE Python process (via subprocess). The child
+# has its own GIL, so its decode work can't block the streamlit thread
+# no matter what pydicom does internally. Results are serialized to a
+# temp pickle and picked up by the parent on the next rerun.
+#
+# Module-level state persists across Streamlit reruns (the script re-runs
+# but imports are cached), so the cache + in-flight dict survive between
+# user interactions. Access is serialized by _PREFETCH_LOCK.
+_PREFETCH_LOCK = threading.Lock()
+_PREFETCH_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+# file_path -> (subprocess.Popen, result_tmp_path)
+_PREFETCH_PENDING: dict = {}
+# Cache is shared with batch_threshold_step (which prefetches up to 2 ahead),
+# so size needs to hold: current + 2 ahead + previous + draw-step entry.
+_PREFETCH_MAX = 6
+# Cap concurrent prefetch subprocesses. Each DBT decode can use ~1-2 GB RAM;
+# previously draw (1-ahead) + threshold (2-ahead) could spawn 3 at once and
+# thrash, causing the threshold step to hang on proc.wait.
+_PREFETCH_CONCURRENCY = 2
 
 
-def _get_display_rgb(file_path, image_slice, img_type, transform):
-    if st.session_state.get("_disp_cache_key") == file_path:
+def _harvest_pending() -> None:
+    """Move any completed subprocess results into the cache and clean up temp files."""
+    with _PREFETCH_LOCK:
+        pending_items = list(_PREFETCH_PENDING.items())
+
+    for path, (proc, tmp) in pending_items:
+        if proc.poll() is None:
+            continue  # still running
+        # Try to read the pickled result
+        result = None
+        if os.path.isfile(tmp):
+            try:
+                with open(tmp, "rb") as f:
+                    result = pickle.load(f)
+            except Exception:
+                result = None
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        err_path = tmp + ".err"
+        if os.path.isfile(err_path):
+            try:
+                os.remove(err_path)
+            except Exception:
+                pass
+        with _PREFETCH_LOCK:
+            _PREFETCH_PENDING.pop(path, None)
+            if result is not None:
+                _PREFETCH_CACHE[path] = result
+                while len(_PREFETCH_CACHE) > _PREFETCH_MAX:
+                    _PREFETCH_CACHE.popitem(last=False)
+
+
+def _prefetch(file_path: str) -> None:
+    """Launch a subprocess to load file_path, unless already cached or in flight."""
+    if not file_path:
+        return
+    _harvest_pending()
+    with _PREFETCH_LOCK:
+        if file_path in _PREFETCH_CACHE or file_path in _PREFETCH_PENDING:
+            return
+        if len(_PREFETCH_PENDING) >= _PREFETCH_CONCURRENCY:
+            return  # at concurrency cap; skip warming this one
+        fd, tmp = tempfile.mkstemp(suffix=".pkl", prefix="prefetch_")
+        os.close(fd)
+        worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_prefetch_worker.py")
+        # CREATE_NO_WINDOW avoids a console flash on Windows; harmless elsewhere.
+        creationflags = 0x08000000 if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            [sys.executable, worker, file_path, tmp],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        _PREFETCH_PENDING[file_path] = (proc, tmp)
+
+
+def _load_slice_prefetched(file_path: str):
+    """Return a cached slice if prefetched; otherwise load sync and cache it."""
+    _harvest_pending()
+    with _PREFETCH_LOCK:
+        cached = _PREFETCH_CACHE.get(file_path)
+    if cached is not None:
+        return cached
+    # If a prefetch subprocess is already running for this file, wait for
+    # it rather than launching a duplicate sync load (which would double
+    # the disk I/O).
+    with _PREFETCH_LOCK:
+        pending = _PREFETCH_PENDING.get(file_path)
+    if pending is not None:
+        proc, tmp = pending
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            # Subprocess is stuck; kill it so a later rerun doesn't re-block
+            # on the same entry, then fall through to a sync load below.
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            with _PREFETCH_LOCK:
+                _PREFETCH_PENDING.pop(file_path, None)
+        except Exception:
+            pass
+        _harvest_pending()
+        with _PREFETCH_LOCK:
+            cached = _PREFETCH_CACHE.get(file_path)
+        if cached is not None:
+            return cached
+    # Cold path — load synchronously on the main thread.
+    result = UnifiedImageLoader.load_slice(file_path)
+    with _PREFETCH_LOCK:
+        _PREFETCH_CACHE[file_path] = result
+        while len(_PREFETCH_CACHE) > _PREFETCH_MAX:
+            _PREFETCH_CACHE.popitem(last=False)
+    return result
+
+
+_DEFAULT_ORIENT = {"rotate_k": 0, "flip_h": False, "flip_v": False}
+
+
+def _orient_keys(file_name: str) -> tuple[str, str, str]:
+    """Per-file widget state keys for rotate/flip. Dashes break some Streamlit widget keys."""
+    safe = file_name.replace(".", "_").replace("/", "_").replace("\\", "_")
+    return f"orient_rot_k_{safe}", f"orient_fh_{safe}", f"orient_fv_{safe}"
+
+
+def _current_orientation(file_name: str) -> dict:
+    """Read orientation from widget state keys (source of truth)."""
+    rot_key, fh_key, fv_key = _orient_keys(file_name)
+    return {
+        "rotate_k": int(st.session_state.get(rot_key, 0)) % 4,
+        "flip_h": bool(st.session_state.get(fh_key, False)),
+        "flip_v": bool(st.session_state.get(fv_key, False)),
+    }
+
+
+def _drop_canvas_state():
+    """
+    Wipe drawing/cache state. Safe to call from a widget callback.
+    Polygon-tracking keys are RESET to empty containers (not popped), because
+    the click handler assumes they exist once the per-file init block has run.
+    """
+    for k in ("mask", "result", "create_mask",
+              "_disp_cache_key", "_disp_img_rgb", "_disp_w", "_disp_h"):
+        st.session_state.pop(k, None)
+    st.session_state["current_points"] = []
+    st.session_state["completed_polygons_display"] = []
+    st.session_state["native_polygons"] = []
+    st.session_state["last_click"] = None
+
+
+def _on_orient_widget_change():
+    """on_change for Flip H/Flip V checkboxes — just clear the canvas state."""
+    _drop_canvas_state()
+
+
+def _on_rotate_click(rot_key: str):
+    st.session_state[rot_key] = (int(st.session_state.get(rot_key, 0)) + 3) % 4
+    _drop_canvas_state()
+
+
+def _on_reset_click(rot_key: str, fh_key: str, fv_key: str):
+    st.session_state[rot_key] = 0
+    st.session_state[fh_key] = False
+    st.session_state[fv_key] = False
+    _drop_canvas_state()
+
+
+def _load_orientation_from_disk(output_path: str) -> dict | None:
+    """Read orientation.json from a completed case, if present."""
+    path = os.path.join(output_path, "orientation.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return {
+            "rotate_k": int(data.get("rotate_k", 0)) % 4,
+            "flip_h": bool(data.get("flip_h", False)),
+            "flip_v": bool(data.get("flip_v", False)),
+        }
+    except Exception:
+        return None
+
+
+def _save_orientation_to_disk(output_path: str, orient: dict) -> None:
+    os.makedirs(output_path, exist_ok=True)
+    with open(os.path.join(output_path, "orientation.json"), "w") as f:
+        json.dump(
+            {
+                "rotate_k": int(orient["rotate_k"]) % 4,
+                "flip_h": bool(orient["flip_h"]),
+                "flip_v": bool(orient["flip_v"]),
+            },
+            f,
+        )
+
+
+
+
+def _get_display_rgb(cache_key, image_slice, img_type, transform):
+    if st.session_state.get("_disp_cache_key") == cache_key:
         return (
             st.session_state["_disp_img_rgb"],
             st.session_state["_disp_w"],
@@ -30,7 +251,7 @@ def _get_display_rgb(file_path, image_slice, img_type, transform):
     arr = np.array(pil_image)
     if arr.ndim == 2:
         arr = np.stack([arr] * 3, axis=-1)
-    st.session_state["_disp_cache_key"] = file_path
+    st.session_state["_disp_cache_key"] = cache_key
     st.session_state["_disp_img_rgb"]   = arr
     st.session_state["_disp_w"]         = display_w
     st.session_state["_disp_h"]         = display_h
@@ -67,8 +288,13 @@ def _build_figure(img_rgb, completed_display, current_points, display_w, display
         margin=dict(l=0, r=0, t=0, b=0),
         coloraxis_showscale=False,
     )
-    fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False)
-    fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+    fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, visible=False)
+    fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False, visible=False)
+    # Hide the x/y tooltip on the image but keep click events.
+    # hoverinfo="none" = no label, events still fire.
+    # hoverinfo="skip" would disable the click pipeline entirely — don't use it here.
+    # hovermode=False at layout level also blocks clicks, so avoid that too.
+    fig.update_traces(hoverinfo="none", hovertemplate=None, selector=dict(type="image"))
 
     for i, poly in enumerate(completed_display):
         if len(poly) < 2:
@@ -214,29 +440,66 @@ def batch_draw_step():
 
     with st.spinner("Loading image..."):
         image_slice, affine, original_shape, slice_index, img_type = (
-            _load_slice_cached(file_path)
+            _load_slice_prefetched(file_path)
         )
+
+    # Warm the NEXT file in the background — exactly once per current
+    # file. Every landmark click causes a Streamlit rerun; without this
+    # session-state guard we'd re-enter _prefetch on every click and,
+    # even though _PREFETCH_PENDING prevents duplicate spawns, the guard
+    # makes the "do it once" behavior explicit and cheap. The subprocess
+    # itself has its own GIL so pydicom decompression there can't freeze
+    # this UI thread.
+    prefetch_key = f"_prefetch_kicked_idx_{current_index}"
+    if not st.session_state.get(prefetch_key):
+        nxt = current_index + 1
+        if nxt < len(batch_files):
+            next_file_path = os.path.join(input_folder, batch_files[nxt])
+            _prefetch(next_file_path)
+        st.session_state[prefetch_key] = True
 
     # =========================================================
     # VIEW MODE  — file already has a saved mask
     # =========================================================
     if is_completed:
         output_path = os.path.join(os.getcwd(), "output", current_file_name)
-        is_dicom    = os.path.isdir(file_path) or file_path.lower().endswith((".dcm", ".dicom"))
-        mask_path   = resolve_dense_mask_path(output_path, prefer_dicom=is_dicom)
 
-        if mask_path is None:
+        # The saved mask is already in the oriented frame; apply the same
+        # orientation to the raw original so they line up on screen.
+        view_orient = (
+            _load_orientation_from_disk(output_path)
+            or dict(_DEFAULT_ORIENT)
+        )
+        view_image = apply_orientation(
+            image_slice,
+            view_orient["rotate_k"], view_orient["flip_h"], view_orient["flip_v"],
+        )
+
+        mask_slice = load_polygon_mask_2d(output_path)
+
+        if mask_slice is None:
             st.warning("Saved mask file not found on disk. You can redraw it below.")
         else:
+            # Surface shape mismatch early. Some tomosynthesis folders bundle
+            # the DBT multi-frame with an ancillary 2D DICOM at a different
+            # resolution; earlier builds of the loader picked the ancillary
+            # file so the saved polygon has the wrong geometry for the DBT
+            # volume that the process step will use. Catching it here saves
+            # the user from a cryptic failure later in Step 4.
+            if mask_slice.shape != view_image.shape:
+                st.warning(
+                    f"Saved mask shape {mask_slice.shape} doesn't match the "
+                    f"current image shape {view_image.shape}. The mask was "
+                    f"drawn on a different image — click **Redraw Mask** "
+                    f"below to fix before running Step 4."
+                )
             st.markdown("### Saved Mask Preview")
             col1, col2 = st.columns(2)
 
             view_transform = DisplayTransform(padding=50)
-            with st.spinner("Loading saved mask..."):
-                mask_slice, _, _, _, _ = _load_slice_cached(mask_path)
 
             present_orig = view_transform.prepare_for_display(
-                image_slice, img_type=img_type, max_width=900, max_height=600
+                view_image, img_type=img_type, max_width=900, max_height=600
             )
             present_mask = view_transform.prepare_for_display(
                 mask_slice, img_type=img_type, max_width=900, max_height=600
@@ -279,11 +542,37 @@ def batch_draw_step():
     # DRAW MODE  — file not yet completed
     # =========================================================
 
+    # Initialize per-file orientation widget state BEFORE any widget renders.
+    # If the user is redrawing a completed file, seed from orientation.json.
+    rot_key, fh_key, fv_key = _orient_keys(current_file_name)
+    if rot_key not in st.session_state:
+        output_path_for_seed = os.path.join(os.getcwd(), "output", current_file_name)
+        disk_orient = _load_orientation_from_disk(output_path_for_seed)
+        if disk_orient is not None:
+            st.session_state[rot_key] = disk_orient["rotate_k"]
+            st.session_state[fh_key] = disk_orient["flip_h"]
+            st.session_state[fv_key] = disk_orient["flip_v"]
+        else:
+            st.session_state[rot_key] = 0
+            st.session_state[fh_key] = False
+            st.session_state[fv_key] = False
+
+    orient = _current_orientation(current_file_name)
+    raw_shape = original_shape
+    slice_dim_raw = int(np.argmin(raw_shape)) if len(raw_shape) == 3 else 0
+    oriented_shape = (
+        orient_shape_3d(raw_shape, slice_dim_raw, orient["rotate_k"])
+        if len(raw_shape) == 3 else raw_shape
+    )
+    oriented_image = apply_orientation(
+        image_slice, orient["rotate_k"], orient["flip_h"], orient["flip_v"]
+    )
+
     if st.session_state.get("current_batch_file") != current_file:
         st.session_state.update({
             "affine":                     affine,
             "original_image_path":        file_path,
-            "original_shape":             original_shape,
+            "original_shape":             oriented_shape,
             "slice_index":                slice_index,
             "current_batch_file":         current_file,
             "img_type":                   img_type,
@@ -295,13 +584,62 @@ def batch_draw_step():
         for k in ("mask", "result", "create_mask", "display_transform",
                   "_disp_cache_key", "_disp_img_rgb", "_disp_w", "_disp_h"):
             st.session_state.pop(k, None)
+    else:
+        # Keep oriented shape in sync if the user flipped/rotated
+        st.session_state["original_shape"] = oriented_shape
+
+    # ---- Orientation controls (callbacks do state mutation; keeps widget
+    #      keys authoritative and avoids "modify widget after creation" errors)
+    st.markdown("### Orientation")
+    ocol1, ocol2, ocol3, ocol4 = st.columns([1.3, 1, 1, 1])
+    with ocol1:
+        st.button(
+            "↻ Rotate 90° CW",
+            use_container_width=True,
+            key=f"rotbtn_{current_file_name}",
+            help="Rotate the image 90° clockwise. Any in-progress polygons will be cleared.",
+            on_click=_on_rotate_click,
+            args=(rot_key,),
+        )
+    with ocol2:
+        st.checkbox(
+            "Flip Horizontally",
+            key=fh_key,
+            on_change=_on_orient_widget_change,
+        )
+    with ocol3:
+        st.checkbox(
+            "Flip Vertically",
+            key=fv_key,
+            on_change=_on_orient_widget_change,
+        )
+    with ocol4:
+        st.button(
+            "Reset Orientation",
+            use_container_width=True,
+            key=f"resetbtn_{current_file_name}",
+            help="Clear rotation and flips for this file.",
+            on_click=_on_reset_click,
+            args=(rot_key, fh_key, fv_key),
+        )
+
+    st.caption(
+        f"Current: rotate={orient['rotate_k'] * 90}° CCW "
+        f"(={(4 - orient['rotate_k']) % 4 * 90}° CW)"
+        f" · flip H={orient['flip_h']} · flip V={orient['flip_v']}"
+    )
 
     if "display_transform" not in st.session_state:
         st.session_state["display_transform"] = DisplayTransform(padding=50)
     transform = st.session_state["display_transform"]
 
+    # Cache display by (file, orientation) so flip/rotate invalidates it
+    disp_cache_id = (
+        file_path,
+        orient["rotate_k"], orient["flip_h"], orient["flip_v"],
+    )
     img_rgb, display_w, display_h = _get_display_rgb(
-        file_path, image_slice, img_type, transform
+        disp_cache_id, oriented_image, img_type, transform
     )
 
     completed_display = st.session_state.get("completed_polygons_display", [])
@@ -402,7 +740,7 @@ def batch_draw_step():
     if st.session_state.get("create_mask", False):
         valid = [p for p in st.session_state.get("native_polygons", []) if len(p) >= 3]
         if valid:
-            result, combined_mask = MaskManager.create_combined_mask(image_slice, valid)
+            result, combined_mask = MaskManager.create_combined_mask(oriented_image, valid)
             st.session_state["mask"]        = combined_mask
             st.session_state["result"]      = result
             st.session_state["output_path"] = os.path.join(
@@ -419,7 +757,7 @@ def batch_draw_step():
         col1, col2 = st.columns(2)
 
         present_img    = transform.prepare_for_display(
-            image_slice, img_type=st.session_state["img_type"]
+            oriented_image, img_type=st.session_state["img_type"]
         )
         present_result = transform.prepare_for_display(
             st.session_state["result"], img_type=st.session_state["img_type"]
@@ -430,18 +768,33 @@ def batch_draw_step():
         with col2:
             st.image(present_result, caption="Segmented Area", use_container_width=True)
 
+        mask_area = int(np.count_nonzero(st.session_state["mask"]))
+        if mask_area == 0:
+            st.error(
+                "The generated mask is empty (0 pixels). The polygon vertices "
+                "likely fell outside the image. Clear points and re-draw before saving."
+            )
+
         _, col_save, _ = st.columns([1, 1, 1])
         with col_save:
-            if st.button("Save Mask & Continue", type="primary"):
+            if st.button("Save Mask & Continue", type="primary", disabled=mask_area == 0):
                 if current_file_name not in st.session_state["batch_completed_files"]["draw"]:
                     with st.spinner("Saving mask…"):
-                        MaskManager.save_mask(
+                        # Fast path: save just the 2D polygon as a single-frame
+                        # RLE-compressed DICOM (~tens of KB). The 3D broadcast
+                        # is deferred to the processing step so drawing flow
+                        # stays responsive even for large DBT volumes.
+                        save_polygon_mask_dcm(
                             mask_2d=st.session_state["mask"],
-                            original_shape=st.session_state["original_shape"],
-                            affine=st.session_state["affine"],
-                            img_type=st.session_state["img_type"],
-                            file_path=st.session_state["output_path"],
-                            original_image_path=st.session_state["original_image_path"],
+                            output_path=st.session_state["output_path"],
+                            source_image_path=st.session_state.get(
+                                "original_image_path"
+                            ),
+                        )
+                        # Persist the orientation used for this file so the
+                        # threshold and process steps can re-apply it on load.
+                        _save_orientation_to_disk(
+                            st.session_state["output_path"], orient
                         )
                     st.session_state["batch_completed_files"]["draw"].append(current_file_name)
                 st.session_state["batch_current_index"] = current_index + 1

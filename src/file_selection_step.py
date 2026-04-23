@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 import json
-from new_utils import resolve_dense_mask_path, resolve_final_mask_path
+from new_utils import resolve_final_mask_path, has_polygon_mask
 
 
 # =============================
@@ -40,7 +40,7 @@ def scan_output_progress(output_folder):
         if rel == '.':
             continue
 
-        if resolve_dense_mask_path(root) is not None:
+        if has_polygon_mask(root):
             progress["draw"].append(rel)
 
         threshold_json = os.path.join(root, "threshold.json")
@@ -165,7 +165,7 @@ def file_selection_step():
     selected_files = st.multiselect(
         "Select files to process:",
         available_files,
-        default=available_files if len(available_files) <= 20 else available_files[:20]
+        default=available_files if len(available_files) <= 300 else available_files[:300]
     )
 
     if len(selected_files) == 0:

@@ -5,7 +5,7 @@ run_all_checks()
 from file_selection_step import file_selection_step
 from batch_draw_step import batch_draw_step
 from batch_threshold_step import batch_threshold_step
-from batch_process_step import batch_process_step
+from batch_process_step import batch_process_step, render_global_bg_badge
 import streamlit as st
 
 # ================== Main App ==================
@@ -111,6 +111,11 @@ def main():
             step_text = "🏠 Main Menu"
         
         st.markdown(f'<div class="current-step"><strong>Current Step:</strong><br>{step_text}</div>', unsafe_allow_html=True)
+
+    # Floating processing-status badge. Pinned top-right via fixed CSS so it
+    # hovers above whatever page is active — the user can see progress while
+    # drawing polygons or adjusting thresholds on another step.
+    render_global_bg_badge()
 
 if __name__ == "__main__":
     main()

@@ -4,14 +4,90 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from ImageLoader import UnifiedImageLoader
-from new_utils import ImageProcessor, DisplayTransform, resolve_dense_mask_path
+from new_utils import (
+    ImageProcessor,
+    DisplayTransform,
+    apply_orientation,
+    load_polygon_mask_2d,
+    has_polygon_mask,
+)
+# Reuse the subprocess-backed prefetch cache from the draw step. Same slow
+# call (pydicom decompresses the whole DBT volume for one slice) — so the
+# same prefetch machinery applies unchanged. Module-level state is shared
+# across steps because Python imports are cached, which is what we want.
+from batch_draw_step import _prefetch, _load_slice_prefetched
+
+# How many upcoming pending files to warm in the background after loading
+# the current one. Each subprocess decode peaks ~1-2 GB RAM transiently,
+# so 2 is a conservative "few" that won't stack up on modest machines.
+_THRESHOLD_PREFETCH_AHEAD = 2
+
+
+def _load_orientation(output_path: str, file_name: str) -> dict:
+    """
+    Orientation lookup order:
+      1. Session state (set during the current run by the draw step)
+      2. orientation.json written by the draw step on save
+      3. Identity (rotate_k=0, no flips)
+    """
+    session = st.session_state.get("batch_orientations", {})
+    orient = session.get(file_name)
+    if orient is not None:
+        return {
+            "rotate_k": int(orient.get("rotate_k", 0)) % 4,
+            "flip_h": bool(orient.get("flip_h", False)),
+            "flip_v": bool(orient.get("flip_v", False)),
+        }
+    path = os.path.join(output_path, "orientation.json")
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return {
+                "rotate_k": int(data.get("rotate_k", 0)) % 4,
+                "flip_h": bool(data.get("flip_h", False)),
+                "flip_v": bool(data.get("flip_v", False)),
+            }
+        except Exception:
+            pass
+    return {"rotate_k": 0, "flip_h": False, "flip_v": False}
+
+
+def _ensure_2d(arr):
+    """
+    Guarantee a 2D slice. Some loader paths (4D NIfTI, odd DICOM layouts)
+    return a 3D slice; squeeze size-1 dims and, if still 3D, take the
+    middle index along the smallest axis — same rule used by the draw step.
+    """
+    arr = np.asarray(arr)
+    if arr.ndim > 2:
+        arr = np.squeeze(arr)
+    if arr.ndim == 3:
+        slice_dim = int(np.argmin(arr.shape))
+        idx = arr.shape[slice_dim] // 2
+        if slice_dim == 0:
+            arr = arr[idx]
+        elif slice_dim == 1:
+            arr = arr[:, idx, :]
+        else:
+            arr = arr[:, :, idx]
+    return arr
 
 
 @st.cache_data(show_spinner=False)
-def _load_display_data(original_image_path, mask_path):
-    """Load + normalise images once per file; cached so the slider doesn't re-read disk."""
-    img, _, _, _, img_type = UnifiedImageLoader.load_slice(original_image_path)
-    msk, _, _, _, _        = UnifiedImageLoader.load_slice(mask_path)
+def _load_display_data(original_image_path, output_path, rotate_k: int, flip_h: bool, flip_v: bool):
+    """Load + normalise images once per (file, orientation); cached so the slider doesn't re-read disk."""
+    # _load_slice_prefetched returns from the shared subprocess cache when the
+    # file was warmed by a previous rerun; otherwise it loads synchronously.
+    img, _, _, _, img_type = _load_slice_prefetched(original_image_path)
+    msk = load_polygon_mask_2d(output_path)
+    if msk is None:
+        raise FileNotFoundError(f"No saved polygon mask found for {output_path}")
+    img = _ensure_2d(img)
+    msk = _ensure_2d(msk)
+    # The mask on disk is already in the oriented frame (draw step saved it
+    # that way); only the original image needs the user orientation applied.
+    img = apply_orientation(img, rotate_k, flip_h, flip_v)
     img_show = ImageProcessor.normalize_image(img)          # uint8 0-255
     msk_show = (msk > 0).astype(np.uint8)                   # binary
     dt = DisplayTransform(padding=0)
@@ -193,8 +269,6 @@ def batch_threshold_step():
     input_folder = st.session_state.get("main_input_folder", os.path.join(os.getcwd(), "media"))
     output_path = os.path.join(os.getcwd(), "output", current_file_name)
     original_image_path = os.path.join(input_folder, current_file)
-    is_dicom = os.path.isdir(original_image_path) or original_image_path.lower().endswith((".dcm", ".dicom"))
-    mask_path = resolve_dense_mask_path(output_path, prefer_dicom=is_dicom)
 
     if not os.path.exists(input_folder):
         st.error(f"The selected main input folder does not exist: {input_folder}")
@@ -202,9 +276,9 @@ def batch_threshold_step():
 
 
     # =====================================================
-    # File existence and image loading 
+    # File existence and image loading
     # =====================================================
-    if mask_path is None:
+    if not has_polygon_mask(output_path):
         st.error("Mask file not found for this case.")
         st.write("This file may not have completed the draw step properly.")
         if st.button("Skip this file"):
@@ -213,13 +287,33 @@ def batch_threshold_step():
         return
 
     try:
-        img_show, msk_show, img_type = _load_display_data(original_image_path, mask_path)
+        orient = _load_orientation(output_path, current_file_name)
+        img_show, msk_show, img_type = _load_display_data(
+            original_image_path, output_path,
+            orient["rotate_k"], orient["flip_h"], orient["flip_v"],
+        )
     except Exception as e:
         st.error(f"Error loading images: {str(e)}")
         if st.button("Skip this file"):
             st.session_state["batch_current_index"] = current_index + 1
             st.rerun()
         return
+
+    # Warm the next few pending files in background subprocesses so that
+    # clicking Save & Continue / Next → lands on an already-decoded slice.
+    # Guarded per index: every slider / number-input interaction reruns the
+    # script, but we only want to kick the prefetch once per displayed file.
+    prefetch_key = f"_threshold_prefetch_idx_{current_index}"
+    if not st.session_state.get(prefetch_key):
+        warmed = 0
+        for idx in range(current_index + 1, len(batch_files)):
+            if warmed >= _THRESHOLD_PREFETCH_AHEAD:
+                break
+            nxt_name = batch_files[idx].split('.')[0]
+            if nxt_name in completed_draw and nxt_name not in completed_threshold:
+                _prefetch(os.path.join(input_folder, batch_files[idx]))
+                warmed += 1
+        st.session_state[prefetch_key] = True
 
     # =====================================================
     # Threshold preview and controls 
