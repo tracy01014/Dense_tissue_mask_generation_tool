@@ -100,13 +100,13 @@ def main():
         # Show current step 
         current_step = st.session_state.get("current_step", "mode_selection")
         if current_step == "file_selection":
-            step_text = "📂 File Selection"
+            step_text = "Step 1 · 📂 Select Files"
         elif current_step == "batch_draw":
-            step_text = "🎨 Drawing Masks"
+            step_text = "Step 2 · 🎨 Draw Masks"
         elif current_step == "batch_threshold":
-            step_text = "🎯 Setting Thresholds"
+            step_text = "Step 3 · 🎯 Adjust Thresholds"
         elif current_step == "batch_process":
-            step_text = "⚙️ Processing Files"
+            step_text = "Step 4 · ⚙️ Process Files"
         else:
             step_text = "🏠 Main Menu"
         

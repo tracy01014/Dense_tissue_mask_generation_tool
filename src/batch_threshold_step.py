@@ -211,13 +211,8 @@ def batch_threshold_step():
     )
     if all_done:
         st.success("🎉 All files masked and thresholded! Ready to process.")
-        if st.button("→ Go to Process Step", type="primary", use_container_width=True):
-            st.session_state["current_step"] = "batch_process"
-            st.rerun()
-        if st.button("← Back to Draw Step", use_container_width=False):
-            st.session_state["current_step"] = "batch_draw"
-            st.rerun()
-        return
+        st.session_state["current_step"] = "batch_process"
+        st.rerun()
 
     # =====================================================
     # File selection and skipping logic 

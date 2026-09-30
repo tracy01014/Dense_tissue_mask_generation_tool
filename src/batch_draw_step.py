@@ -329,7 +329,6 @@ def _build_figure(img_rgb, completed_display, current_points, display_w, display
 
 
 def batch_draw_step():
-    st.header("Step 2: Draw Masks")
     with open("static/batch_draw_step.css") as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
@@ -352,18 +351,6 @@ def batch_draw_step():
     st.write(f"### Progress: {len(completed_draw)}/{total_files} files completed")
     st.progress(len(completed_draw) / total_files)
 
-    # Allow jumping to threshold step whenever at least one mask exists
-    if len(completed_draw) > 0:
-        if st.button(
-            f"→ Go to Threshold Step ({len(completed_draw)} file{'s' if len(completed_draw) != 1 else ''} ready)",
-            type="primary",
-            use_container_width=True,
-        ):
-            st.session_state.pop("draw_return_index", None)  # manual jump: free navigation
-            st.session_state["batch_current_index"] = 0
-            st.session_state["current_step"] = "batch_threshold"
-            st.rerun()
-
     if current_index >= len(batch_files):
         completed_threshold = st.session_state["batch_completed_files"]["threshold"]
         all_thresholded = all(
@@ -373,7 +360,7 @@ def batch_draw_step():
         if all_thresholded:
             st.success("All masks drawn and thresholds set! Ready to process.")
             if st.button("→ Go to Process Step", type="primary", use_container_width=True):
-                st.session_state.pop("draw_return_index", None)
+                # st.session_state.pop("draw_return_index", None)
                 st.session_state["current_step"] = "batch_process"
                 st.rerun()
         else:
@@ -387,6 +374,18 @@ def batch_draw_step():
             st.session_state["current_step"] = "file_selection"
             st.rerun()
         return
+
+        # Allow jumping to threshold step whenever at least one mask exists
+    # if len(completed_draw) > 0:
+    #     if st.button(
+    #         f"→ Go to Threshold Step ({len(completed_draw)} file{'s' if len(completed_draw) != 1 else ''} ready)",
+    #         type="primary",
+    #         use_container_width=True,
+    #     ):
+    #         st.session_state.pop("draw_return_index", None)  # manual jump: free navigation
+    #         st.session_state["batch_current_index"] = 0
+    #         st.session_state["current_step"] = "batch_threshold"
+    #         st.rerun()
 
     # ---- Jump-to dropdown ----
     def _make_label(i, f):
