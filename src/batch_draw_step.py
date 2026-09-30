@@ -359,16 +359,30 @@ def batch_draw_step():
             type="primary",
             use_container_width=True,
         ):
+            st.session_state.pop("draw_return_index", None)  # manual jump: free navigation
             st.session_state["batch_current_index"] = 0
             st.session_state["current_step"] = "batch_threshold"
             st.rerun()
 
     if current_index >= len(batch_files):
-        st.success("All masks have been drawn!")
-        if st.button("Continue to Threshold Step"):
-            st.session_state["batch_current_index"] = 0
-            st.session_state["current_step"] = "batch_threshold"
-            st.rerun()
+        completed_threshold = st.session_state["batch_completed_files"]["threshold"]
+        all_thresholded = all(
+            f in completed_threshold
+            for f in st.session_state["batch_files_without_extension"]
+        )
+        if all_thresholded:
+            st.success("All masks drawn and thresholds set! Ready to process.")
+            if st.button("→ Go to Process Step", type="primary", use_container_width=True):
+                st.session_state.pop("draw_return_index", None)
+                st.session_state["current_step"] = "batch_process"
+                st.rerun()
+        else:
+            st.success("All masks have been drawn!")
+            if st.button("Continue to Threshold Step"):
+                st.session_state.pop("draw_return_index", None)
+                st.session_state["batch_current_index"] = 0
+                st.session_state["current_step"] = "batch_threshold"
+                st.rerun()
         if st.button("Back to File Selection"):
             st.session_state["current_step"] = "file_selection"
             st.rerun()
@@ -797,7 +811,10 @@ def batch_draw_step():
                             st.session_state["output_path"], orient
                         )
                     st.session_state["batch_completed_files"]["draw"].append(current_file_name)
-                st.session_state["batch_current_index"] = current_index + 1
+                # Go threshold this file immediately, then return to draw for the next one.
+                st.session_state["batch_current_index"] = current_index
+                st.session_state["draw_return_index"] = current_index + 1
                 _clear_draw_state()
                 st.toast(f"Mask saved for {current_file}!", icon="✅")
+                st.session_state["current_step"] = "batch_threshold"
                 st.rerun()

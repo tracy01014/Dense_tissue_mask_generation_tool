@@ -178,6 +178,23 @@ def batch_threshold_step():
             st.rerun()
 
     # =====================================================
+    # Draw-then-threshold flow: if we were sent here from the draw step
+    # after saving a single mask, bounce straight back to draw for the
+    # next file WITHOUT showing any completion screen.
+    # =====================================================
+    draw_return = st.session_state.get("draw_return_index")
+    if draw_return is not None:
+        # Only redirect AFTER the threshold for the current file is saved.
+        # If it isn't saved yet, fall through and show the threshold UI.
+        current_file_for_check = batch_files[current_index] if current_index < len(batch_files) else None
+        current_file_name_for_check = current_file_for_check.split('.')[0] if current_file_for_check else None
+        if current_file_name_for_check and current_file_name_for_check in completed_threshold:
+            st.session_state.pop("draw_return_index", None)
+            st.session_state["batch_current_index"] = draw_return
+            st.session_state["current_step"] = "batch_draw"
+            st.rerun()
+
+    # =====================================================
     # Progress bar and overall navigation
     # =====================================================
     # Use only files that have a mask as the denominator
@@ -186,20 +203,17 @@ def batch_threshold_step():
     st.progress(len(completed_threshold) / files_with_mask if files_with_mask else 0)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Show process button as soon as at least one file has both mask + threshold
-    if len(completed_threshold) > 0:
-        if st.button(
-            f"→ Go to Process Step ({len(completed_threshold)} file{'s' if len(completed_threshold) != 1 else ''} ready)",
-            type="primary",
-            use_container_width=True,
-        ):
+    # "Done" when every masked file also has a threshold — show completion message
+    batch_files_without_ext = st.session_state.get("batch_files_without_extension", [])
+    all_done = (
+        all(f in completed_draw for f in batch_files_without_ext)
+        and all(f in completed_threshold for f in batch_files_without_ext)
+    )
+    if all_done:
+        st.success("🎉 All files masked and thresholded! Ready to process.")
+        if st.button("→ Go to Process Step", type="primary", use_container_width=True):
             st.session_state["current_step"] = "batch_process"
             st.rerun()
-
-    # "Done" when every masked file also has a threshold — show completion message
-    all_masked_files_thresholded = all(f in completed_threshold for f in completed_draw)
-    if current_index >= len(batch_files) or all_masked_files_thresholded:
-        st.success(f"🎉 All {files_with_mask} masked files have been thresholded!")
         if st.button("← Back to Draw Step", use_container_width=False):
             st.session_state["current_step"] = "batch_draw"
             st.rerun()
@@ -420,10 +434,11 @@ def batch_threshold_step():
                 with open(threshold_json, "w") as f:
                     json.dump({"threshold": threshold}, f)
                 st.session_state["batch_completed_files"]["threshold"].append(current_file_name)
-                st.session_state["batch_current_index"] = current_index + 1
                 st.success(f"Threshold {threshold:.2f} saved successfully!")
             except Exception as e:
                 st.error(f"Could not save threshold: {e}")
+            # Rerun: the top-of-page draw_return_index check will bounce
+            # back to the draw step if we're in one-file-at-a-time mode.
             st.rerun()
     
     with button_col3:
